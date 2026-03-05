@@ -31,9 +31,18 @@ def train(args):
     if args.offload_rollout:
         ray.get(rollout_manager.onload_kv.remote())
 
+    def _run_eval(rollout_id):
+        """Run evaluation: SFT validation loss (Megatron) or RL reward eval (sglang)."""
+        if args.debug_train_only and getattr(args, "eval_datasets", None):
+            val_data = ray.get(rollout_manager.generate_sft_val_data.remote(rollout_id))
+            if val_data is not None:
+                actor_model.compute_sft_val_loss(rollout_id, val_data)
+        else:
+            ray.get(rollout_manager.eval.remote(rollout_id))
+
     # special case for eval-only
     if args.num_rollout == 0 and args.eval_interval is not None:
-        ray.get(rollout_manager.eval.remote(rollout_id=0))
+        _run_eval(0)
 
     def offload_train(rollout_id):
         if args.offload_train:
@@ -64,7 +73,7 @@ def train(args):
     # note that for async training, one can change the position of the sync operation(ray.get).
     for rollout_id in range(args.start_rollout_id, args.num_rollout):
         if args.eval_interval is not None and rollout_id == 0 and not args.skip_eval_before_train:
-            ray.get(rollout_manager.eval.remote(rollout_id))
+            _run_eval(rollout_id)
 
         rollout_data_ref = ray.get(rollout_manager.generate.remote(rollout_id))
 
@@ -90,7 +99,7 @@ def train(args):
             ray.get(rollout_manager.onload_kv.remote())
 
         if should_run_periodic_action(rollout_id, args.eval_interval, num_rollout_per_epoch):
-            ray.get(rollout_manager.eval.remote(rollout_id))
+            _run_eval(rollout_id)
 
     ray.get(rollout_manager.dispose.remote())
 

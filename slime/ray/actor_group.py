@@ -137,5 +137,14 @@ class RayTrainGroup:
             ]
         )
 
+    def compute_sft_val_loss(self, rollout_id, val_data_refs_by_dataset):
+        """Compute SFT validation loss across all actor replicas."""
+        return ray.get(
+            [
+                actor.compute_sft_val_loss.remote(rollout_id, val_data_refs_by_dataset)
+                for actor in self._actor_handlers
+            ]
+        )
+
     def set_rollout_manager(self, rollout_manager):
         return ray.get([actor.set_rollout_manager.remote(rollout_manager) for actor in self._actor_handlers])

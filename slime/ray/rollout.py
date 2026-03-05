@@ -428,6 +428,71 @@ class RolloutManager:
         self._save_debug_rollout_data(data, rollout_id=rollout_id, evaluation=True)
         _log_eval_rollout_data(rollout_id, self.args, data, result.metrics)
 
+    def generate_sft_val_data(self, rollout_id):
+        """Tokenize validation datasets and return Megatron rollout-data refs.
+
+        Calls the eval rollout function with ``evaluation=True`` (defaults to
+        ``sft_rollout.generate_rollout``) to tokenize each configured eval
+        dataset, then packages the results into the same rollout-data format
+        used for training, split evenly across DP ranks.
+
+        The returned dict is consumed by
+        ``MegatronTrainRayActor.compute_sft_val_loss``, which runs a
+        forward-only SFT-loss pass without needing any sglang engines.
+
+        Returns:
+            ``dict`` mapping dataset name → ``list[Box]`` (one per DP rank),
+            or ``None`` if no eval datasets are configured or all are empty.
+        """
+        if not (getattr(self.args, "eval_datasets", None) or []):
+            return None
+
+        result = call_rollout_fn(
+            self.eval_generate_rollout, self.args, rollout_id, self.data_source, evaluation=True
+        )
+
+        dp_size = self.train_parallel_config["dp_size"]
+        # For fixed micro-batch size, trim to a multiple of dp_size * micro_batch_size
+        # so every DP rank has an integer number of micro-batches.
+        trim_unit = dp_size if self.args.use_dynamic_batch_size else dp_size * self.args.micro_batch_size
+
+        val_data_by_dataset = {}
+        for dataset_name, dataset_data in result.data.items():
+            samples = dataset_data.get("samples", [])
+            n = (len(samples) // trim_unit) * trim_unit
+            if n == 0:
+                logger.warning(
+                    f"generate_sft_val_data: '{dataset_name}' needs at least "
+                    f"{trim_unit} samples (dp_size={dp_size}), got {len(samples)}. Skipping."
+                )
+                continue
+            samples = samples[:n]
+
+            tokens = [s.tokens for s in samples]
+            total_lengths = [len(t) for t in tokens]
+            # Balanced equal-size split: every DP rank gets exactly n // dp_size samples.
+            partitions = get_seqlen_balanced_partitions(total_lengths, dp_size, equal_size=True)
+
+            val_data_by_dataset[dataset_name] = [
+                Box(ray.put({
+                    "partition": partitions[i],
+                    "tokens": [tokens[j] for j in partitions[i]],
+                    "response_lengths": [samples[j].response_length for j in partitions[i]],
+                    "loss_masks": [
+                        samples[j].loss_mask if samples[j].loss_mask is not None
+                        else [1] * samples[j].response_length
+                        for j in partitions[i]
+                    ],
+                    # process_rollout_data slices total_lengths via partition
+                    "total_lengths": total_lengths,
+                    # treat the whole val set as one global batch
+                    "dynamic_global_batch_size": n,
+                }))
+                for i in range(dp_size)
+            ]
+
+        return val_data_by_dataset or None
+
     def save(self, rollout_id):
         self.data_source.save(rollout_id)
 
