@@ -27,12 +27,14 @@ def train(args):
     if args.check_weight_update_equal:
         ray.get(rollout_manager.check_weights.remote(action="compare"))
 
-    def _run_sft_val_loss(rollout_id):
-        """Compute SFT validation NLL loss on the Megatron training model."""
+    def _run_eval(rollout_id):
+        """Run evaluation: SFT validation loss (Megatron) or RL reward eval (sglang)."""
         if args.debug_train_only and getattr(args, "eval_datasets", None):
             val_data = ray.get(rollout_manager.generate_sft_val_data.remote(rollout_id))
             if val_data is not None:
                 actor_model.compute_sft_val_loss(rollout_id, val_data)
+        else:
+            ray.get(rollout_manager.eval.remote(rollout_id))
 
     # async train loop.
     rollout_data_next_future = rollout_manager.generate.remote(args.start_rollout_id)
@@ -53,11 +55,6 @@ def train(args):
         else:
             ray.get(actor_model.async_train(rollout_id, rollout_data_curr_ref))
 
-        # SFT validation loss: compute before weight update to sglang, while
-        # the Megatron model holds the freshly updated weights.
-        if should_run_periodic_action(rollout_id, args.eval_interval, num_rollout_per_epoch):
-            _run_sft_val_loss(rollout_id)
-
         if should_run_periodic_action(rollout_id, args.save_interval, num_rollout_per_epoch, args.num_rollout):
             actor_model.save_model(
                 rollout_id,
@@ -77,10 +74,8 @@ def train(args):
             rollout_data_next_future = None
             actor_model.update_weights()
 
-        # RL-style eval: after weight update to sglang engines.
         if should_run_periodic_action(rollout_id, args.eval_interval, num_rollout_per_epoch):
-            if not args.debug_train_only:
-                ray.get(rollout_manager.eval.remote(rollout_id))
+            _run_eval(rollout_id)
 
     ray.get(rollout_manager.dispose.remote())
 
