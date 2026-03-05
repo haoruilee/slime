@@ -50,6 +50,23 @@ SFT_ARGS=(
    --debug-train-only
 )
 
+# Optional: enable validation loss monitoring to detect overfitting.
+# Provide a held-out validation file (same format as --prompt-data) and set
+# --eval-interval to the desired frequency (in rollouts).
+#
+# EVAL_ARGS=(
+#    --eval-prompt-data val /root/openhermes2_5_val.parquet
+#    --eval-interval 10
+# )
+#
+# Or use a YAML config for richer per-dataset settings (see
+# docs/en/customization/eval.md for the schema):
+#
+# EVAL_ARGS=(
+#    --eval-config /root/sft_eval_config.yaml
+#    --eval-interval 10
+# )
+
 PERF_ARGS=(
    --tensor-model-parallel-size 1
    --sequence-parallel

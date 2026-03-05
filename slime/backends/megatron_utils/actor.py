@@ -14,7 +14,7 @@ from torch_memory_saver import torch_memory_saver
 from transformers import AutoConfig, AutoTokenizer
 
 from slime.ray.train_actor import TrainRayActor
-from slime.utils import train_dump_utils
+from slime.utils import logging_utils, train_dump_utils
 from slime.utils.data import process_rollout_data
 from slime.utils.distributed_utils import get_gloo_group, init_process_group
 from slime.utils.logging_utils import init_tracking
@@ -32,7 +32,7 @@ from .cp_utils import slice_log_prob_with_cp, slice_with_cp
 from .data import DataIterator, get_data_iterator, log_perf_data, log_rollout_data, sync_actor_critic_data
 from .initialize import init, is_megatron_main_rank
 from .loss import compute_advantages_and_returns, get_log_probs_and_entropy, get_values
-from .model import forward_only, initialize_model_and_optimizer, save, train
+from .model import compute_val_loss, forward_only, initialize_model_and_optimizer, save, train
 from .update_weight.common import named_params_and_buffers
 from .update_weight.update_weight_from_distributed import UpdateWeightFromDistributed
 from .update_weight.update_weight_from_tensor import UpdateWeightFromTensor
@@ -503,6 +503,59 @@ class MegatronTrainRayActor(TrainRayActor):
                 self.weights_backuper.backup("ref")
 
         log_perf_data(rollout_id, self.args)
+
+    def compute_sft_val_loss(self, rollout_id: int, val_data_refs_by_dataset: dict) -> None:
+        """Compute SFT validation NLL loss for each configured eval dataset.
+
+        Runs a forward-only pass (no gradients, no optimizer step) through the
+        Megatron training model for every validation dataset, using the same
+        ``sft_loss_function`` as during training.  Results are logged as
+        ``eval/<dataset_name>/loss`` and ``eval/<dataset_name>/perplexity``.
+
+        This method is intended to be called periodically during SFT training
+        (``--debug-train-only`` mode) at ``--eval-interval`` rollouts to
+        monitor overfitting on a held-out validation set.
+
+        Args:
+            rollout_id: Current rollout id, used to compute the logging step.
+            val_data_refs_by_dataset: Dict returned by
+                ``RolloutManager.generate_sft_val_data``, mapping dataset name
+                to a list of ``Box`` refs (one per DP rank).
+        """
+        if self.args.debug_rollout_only:
+            return
+
+        if not val_data_refs_by_dataset:
+            return
+
+        log_dict = {}
+
+        for dataset_name, val_data_refs in val_data_refs_by_dataset.items():
+            with timer(f"sft_val_loss_{dataset_name}"):
+                rollout_data = self._get_rollout_data(val_data_refs)
+                data_iterator, num_microbatches = get_data_iterator(self.args, self.model, rollout_data)
+
+                val_loss_dict = compute_val_loss(
+                    self.model,
+                    data_iterator,
+                    num_microbatches,
+                )
+
+            if is_megatron_main_rank():
+                for key, value in val_loss_dict.items():
+                    log_dict[f"eval/{dataset_name}/{key}"] = value
+                    if key == "loss":
+                        import math
+
+                        log_dict[f"eval/{dataset_name}/perplexity"] = math.exp(min(value, 20))
+
+        if is_megatron_main_rank() and log_dict:
+            from slime.utils.metric_utils import compute_rollout_step
+
+            step = compute_rollout_step(self.args, rollout_id)
+            log_dict["eval/step"] = step
+            logger.info(f"sft val loss {rollout_id}: {log_dict}")
+            logging_utils.log(self.args, log_dict, step_key="eval/step")
 
     @timer
     def save_model(self, rollout_id: int, force_sync: bool = False) -> None:

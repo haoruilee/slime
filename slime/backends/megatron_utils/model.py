@@ -296,6 +296,128 @@ def forward_only(
     return rollout_data
 
 
+@torch.no_grad()
+def compute_val_loss(
+    model: Sequence[DDP],
+    data_iterator: Sequence[DataIterator],
+    num_microbatches: Sequence[int],
+) -> dict[str, float]:
+    """Compute validation loss using a forward-only pass through the model.
+
+    Mirrors the training forward step (including SFT loss masking) but with
+    ``forward_only=True`` so no gradients are computed and the optimizer is
+    not touched.  Useful for monitoring overfitting during SFT by logging
+    ``eval/<dataset>/loss`` at regular intervals.
+
+    The function temporarily switches the model to *eval* mode (disabling
+    dropout), then restores *train* mode afterwards.  Results are all-reduced
+    across data-parallel ranks so every rank holds the same global mean loss.
+
+    Args:
+        model: Sequence of DDP-wrapped model chunks (same as used in training).
+        data_iterator: Iterable(s) yielding validation micro-batches.
+        num_microbatches: Number of micro-batches per rollout step.
+
+    Returns:
+        A ``dict`` mapping metric names (e.g. ``"loss"``) to their global mean
+        values on the pipeline last stage; an empty dict on all other stages.
+    """
+    args = get_args()
+
+    for iterator in data_iterator:
+        iterator.reset()
+
+    for model_module in model:
+        model_module.eval()
+
+    config = get_model_config(model[0])
+    config.timers = None
+
+    forward_backward_func = get_forward_backward_func()
+    losses_reduced_all = []
+    num_steps_per_rollout = len(num_microbatches)
+
+    def _make_forward_step(step_num_microbatches: int):
+        def forward_step(
+            data_iterator: DataIterator,
+            model: DDP,
+            return_schedule_plan: bool = False,
+        ) -> tuple[torch.Tensor, Callable]:
+            assert not return_schedule_plan
+            batch = get_batch(
+                data_iterator,
+                [
+                    "tokens",
+                    "multimodal_train_inputs",
+                    "packed_seq_params",
+                    "total_lengths",
+                    "response_lengths",
+                    "loss_masks",
+                    "log_probs",
+                    "ref_log_probs",
+                    "values",
+                    "advantages",
+                    "returns",
+                    "rollout_log_probs",
+                    "max_seq_lens",
+                    "teacher_log_probs",
+                ],
+                args.data_pad_size_multiplier,
+                args.qkv_format,
+                args.allgather_cp,
+            )
+            forward_kwargs = {
+                "input_ids": batch["tokens"],
+                "position_ids": None,
+                "attention_mask": None,
+                "labels": None,
+                "packed_seq_params": batch["packed_seq_params"],
+                "loss_mask": batch["full_loss_masks"],
+            }
+            if batch["multimodal_train_inputs"] is not None:
+                forward_kwargs.update(batch["multimodal_train_inputs"])
+            output_tensor = model(**forward_kwargs)
+            return output_tensor, partial(loss_function, args, batch, step_num_microbatches)
+
+        return forward_step
+
+    for step_id in range(num_steps_per_rollout):
+        step_losses = forward_backward_func(
+            forward_step_func=_make_forward_step(num_microbatches[step_id]),
+            data_iterator=data_iterator,
+            model=model,
+            num_microbatches=num_microbatches[step_id],
+            seq_length=args.seq_length,
+            micro_batch_size=args.micro_batch_size,
+            forward_only=True,
+        )
+        losses_reduced_all.extend(step_losses)
+
+    for model_module in model:
+        model_module.train()
+
+    if not mpu.is_pipeline_last_stage(ignore_virtual=True) or not losses_reduced_all:
+        return {}
+
+    keys = losses_reduced_all[0]["keys"]
+    values = None
+    for x in losses_reduced_all:
+        if values is None:
+            values = x["values"].clone()
+        else:
+            values += x["values"]
+
+    torch.distributed.all_reduce(values, group=mpu.get_data_parallel_group(with_context_parallel=True))
+
+    loss_reduced = {}
+    values_list = values.tolist()
+    num_samples_or_tokens = values_list[0]
+    for key, value in zip(keys, values_list[1:], strict=False):
+        loss_reduced[key] = value * mpu.get_context_parallel_world_size() / num_samples_or_tokens
+
+    return loss_reduced
+
+
 def train_one_step(
     args: Namespace,
     rollout_id: int,

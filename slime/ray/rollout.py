@@ -428,6 +428,99 @@ class RolloutManager:
         self._save_debug_rollout_data(data, rollout_id=rollout_id, evaluation=True)
         _log_eval_rollout_data(rollout_id, self.args, data, result.metrics)
 
+    def generate_sft_val_data(self, rollout_id):
+        """Tokenize validation datasets for SFT validation-loss computation.
+
+        Calls the eval rollout function (``self.eval_generate_rollout``, which
+        defaults to ``sft_rollout.generate_rollout``) with ``evaluation=True``
+        to tokenize every sample in each configured eval dataset.  The
+        resulting per-sample data are converted into the same rollout-data
+        format used for training and split evenly across DP ranks.
+
+        The returned dict is passed directly to
+        ``MegatronTrainRayActor.compute_sft_val_loss``, which runs a
+        forward-only SFT-loss pass on the Megatron training model (no
+        sglang engines required).
+
+        Args:
+            rollout_id: Current rollout id (used for logging).
+
+        Returns:
+            A ``dict`` mapping dataset name → ``list[Box]`` (one ``Box``
+            per DP rank), or ``None`` if no eval datasets are configured.
+        """
+        eval_datasets = getattr(self.args, "eval_datasets", []) or []
+        if not eval_datasets:
+            return None
+
+        result = call_rollout_fn(
+            self.eval_generate_rollout, self.args, rollout_id, self.data_source, evaluation=True
+        )
+
+        dp_size = self.train_parallel_config["dp_size"]
+
+        val_data_by_dataset = {}
+        for dataset_name, dataset_data in result.data.items():
+            samples = dataset_data.get("samples", [])
+            if not samples:
+                logger.warning(
+                    f"generate_sft_val_data: dataset '{dataset_name}' has no samples, skipping."
+                )
+                continue
+
+            tokens = [s.tokens for s in samples]
+            response_lengths = [s.response_length for s in samples]
+            loss_masks = [
+                s.loss_mask if s.loss_mask is not None else [1] * s.response_length for s in samples
+            ]
+            total_lengths = [len(t) for t in tokens]
+
+            n = len(samples)
+            if self.args.use_dynamic_batch_size:
+                trim_unit = dp_size
+            else:
+                trim_unit = dp_size * self.args.micro_batch_size
+
+            n_trimmed = (n // trim_unit) * trim_unit
+            if n_trimmed == 0:
+                logger.warning(
+                    f"generate_sft_val_data: dataset '{dataset_name}' has {n} samples but "
+                    f"needs at least {trim_unit} (dp_size={dp_size}). Skipping."
+                )
+                continue
+            if n_trimmed < n:
+                logger.info(
+                    f"generate_sft_val_data: trimming '{dataset_name}' from {n} to "
+                    f"{n_trimmed} samples to fit DP partitioning."
+                )
+                tokens = tokens[:n_trimmed]
+                response_lengths = response_lengths[:n_trimmed]
+                loss_masks = loss_masks[:n_trimmed]
+                total_lengths = total_lengths[:n_trimmed]
+
+            # Use balanced equal-size partitioning so every DP rank gets
+            # exactly n_trimmed // dp_size samples.
+            partitions = get_seqlen_balanced_partitions(total_lengths, dp_size, equal_size=True)
+
+            rollout_data_refs = []
+            for i in range(dp_size):
+                partition = partitions[i]
+                rollout_data = {
+                    "partition": partition,
+                    "tokens": [tokens[j] for j in partition],
+                    "response_lengths": [response_lengths[j] for j in partition],
+                    "loss_masks": [loss_masks[j] for j in partition],
+                    # total_lengths is split by process_rollout_data using partition
+                    "total_lengths": total_lengths,
+                    # process all val samples in a single training step
+                    "dynamic_global_batch_size": n_trimmed,
+                }
+                rollout_data_refs.append(Box(ray.put(rollout_data)))
+
+            val_data_by_dataset[dataset_name] = rollout_data_refs
+
+        return val_data_by_dataset if val_data_by_dataset else None
+
     def save(self, rollout_id):
         self.data_source.save(rollout_id)
 
